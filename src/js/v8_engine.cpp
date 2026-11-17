@@ -104,10 +104,6 @@ public:
             delete handle;
         }
         frameHandles_.clear();
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
-        }
-        frameNativeFunctions_.clear();
         for (auto& entry : moduleCache_) {
             entry.second.Reset();
         }
@@ -551,17 +547,26 @@ public:
         auto* fnPtr = new NativeFunction(fn);
         v8::Local<v8::External> external = v8::External::New(isolate_, fnPtr);
 
-        // Track per-frame NativeFunction allocations for cleanup
-        // Init-time functions (created before beginFrame) are NOT tracked
-        // and persist for the lifetime of the engine
-        // Also skip tracking when suspended (for cached wrapper creation)
-        if (inFrame_ && !frameTrackingSuspended_) {
-            frameNativeFunctions_.push_back(fnPtr);
-        }
-
         // Use Function::New instead of FunctionTemplate::New — lighter weight,
         // avoids SharedFunctionInfo/FeedbackVector accumulation that prevents GC
         v8::Local<v8::Function> func = v8::Function::New(context, nativeCallback, external).ToLocalChecked();
+
+        // Free per-frame NativeFunction allocations when V8 collects the JS
+        // function, not at the end of the frame. Freeing at frame end was a
+        // use-after-free whenever JS kept the function beyond the frame (for
+        // example methods on GPU objects that three.js caches): the next call
+        // jumped through a dangling pointer (SIGSEGV in nativeCallback).
+        // Init-time functions (created before beginFrame) and functions created
+        // while tracking is suspended still persist for the engine's lifetime.
+        if (inFrame_ && !frameTrackingSuspended_) {
+            auto* owner = new NativeFunctionOwner{v8::Global<v8::Function>(isolate_, func), fnPtr};
+            owner->function.SetWeak(owner, [](const v8::WeakCallbackInfo<NativeFunctionOwner>& data) {
+                NativeFunctionOwner* o = data.GetParameter();
+                o->function.Reset();
+                delete o->fn;
+                delete o;
+            }, v8::WeakCallbackType::kParameter);
+        }
 
         v8::Persistent<v8::Value>* persistent = new v8::Persistent<v8::Value>(isolate_, func);
         frameHandles_.insert(persistent);
@@ -794,12 +799,6 @@ public:
             }
         }
         frameHandles_.clear();
-
-        // Free NativeFunction allocations created during this frame
-        for (auto* fn : frameNativeFunctions_) {
-            delete fn;
-        }
-        frameNativeFunctions_.clear();
 
         inFrame_ = false;
 
@@ -1162,6 +1161,13 @@ private:
         v8::Isolate* isolate = nullptr;
     };
 
+    // Owns a NativeFunction created during a frame; freed by a V8 weak callback
+    // once the JS function wrapping it has been garbage collected.
+    struct NativeFunctionOwner {
+        v8::Global<v8::Function> function;
+        NativeFunction* fn;
+    };
+
     v8::Isolate* isolate_ = nullptr;
     v8::ArrayBuffer::Allocator* allocator_ = nullptr;
     v8::Global<v8::Context> context_;
@@ -1171,7 +1177,6 @@ private:
     std::unordered_map<std::string, v8::Global<v8::Module>> moduleCache_;
     std::unordered_map<int, std::string> moduleIdToPath_;  // Reverse lookup: module hash -> path
     std::unordered_set<v8::Persistent<v8::Value>*> frameHandles_;  // Handles to free at end of frame
-    std::vector<NativeFunction*> frameNativeFunctions_;  // NativeFunction allocations to free at end of frame
     bool inFrame_ = false;  // True during animation frame execution
     bool frameTrackingSuspended_ = false;  // When true, skip frame tracking for new allocations
 };

@@ -211,6 +211,14 @@ Context::~Context() {
         wgpuTextureRelease((WGPUTexture)offscreenTexture_);
         offscreenTexture_ = nullptr;
     }
+    // Release the surface BEFORE the device. Releasing the surface detaches
+    // its swap chain, which needs the device. With Dawn, dropping the last
+    // device reference destroys the Vulkan device, so the old order crashed
+    // on exit (SIGSEGV in dawn::native::vulkan::SwapChain::DetachFromSurfaceImpl).
+    if (surface_) {
+        wgpuSurfaceRelease(surface_);
+        surface_ = nullptr;
+    }
     if (device_) {
         wgpuDeviceRelease(device_);
         device_ = nullptr;
@@ -218,10 +226,6 @@ Context::~Context() {
     if (adapter_) {
         wgpuAdapterRelease(adapter_);
         adapter_ = nullptr;
-    }
-    if (surface_) {
-        wgpuSurfaceRelease(surface_);
-        surface_ = nullptr;
     }
     if (instance_) {
         wgpuInstanceRelease(instance_);

@@ -3898,6 +3898,65 @@ globalThis.__mystralNativeDecodeDracoAsync = function(buffer, attrs) {
         )";
         jsEngine_->eval(imageSupportInit, "image-support-init");
 
+        // DOM compatibility used by three.js controls (OrbitControls, etc.):
+        // - canvas.getRootNode() / canvas.ownerDocument, used to attach
+        //   pointermove/pointerup/keydown listeners to the document.
+        // - working removeEventListener on canvas, document and window. The
+        //   native removeEventListener is a no-op (the engine API can't compare
+        //   callback handles), so listeners are registered through a wrapper
+        //   that removeEventListener switches off. Without this, disposed
+        //   controls keep receiving events forever.
+        const char* domCompatInit = R"(
+            (function() {
+                function patchTarget(target) {
+                    if (!target || target.__mystralListenerPatch) return;
+                    var nativeAdd = target.addEventListener;
+                    if (typeof nativeAdd !== 'function') return;
+                    var registry = [];  // { type, listener, capture, wrapper }
+                    function captureOf(options) {
+                        return typeof options === 'object' && options !== null ? !!options.capture : !!options;
+                    }
+                    target.addEventListener = function(type, listener, options) {
+                        if (typeof listener !== 'function' && !(listener && typeof listener.handleEvent === 'function')) return;
+                        var capture = captureOf(options);
+                        for (var i = 0; i < registry.length; i++) {
+                            var r = registry[i];
+                            if (r.type === type && r.listener === listener && r.capture === capture) return;
+                        }
+                        var once = typeof options === 'object' && options !== null && !!options.once;
+                        var entry = { type: type, listener: listener, capture: capture, active: true };
+                        entry.wrapper = function(event) {
+                            if (!entry.active) return;
+                            if (once) target.removeEventListener(type, listener, options);
+                            return typeof listener === 'function' ? listener.call(target, event) : listener.handleEvent(event);
+                        };
+                        registry.push(entry);
+                        nativeAdd.call(target, type, entry.wrapper, capture);
+                    };
+                    target.removeEventListener = function(type, listener, options) {
+                        var capture = captureOf(options);
+                        for (var i = 0; i < registry.length; i++) {
+                            var r = registry[i];
+                            if (r.type === type && r.listener === listener && r.capture === capture) {
+                                r.active = false;  // native list keeps the inert wrapper
+                                registry.splice(i, 1);
+                                return;
+                            }
+                        }
+                    };
+                    target.__mystralListenerPatch = true;
+                }
+                if (typeof canvas !== 'undefined' && canvas) {
+                    if (!canvas.getRootNode) canvas.getRootNode = function() { return document; };
+                    if (!canvas.ownerDocument) canvas.ownerDocument = document;
+                    patchTarget(canvas);
+                }
+                patchTarget(document);
+                patchTarget(globalThis);
+            })();
+        )";
+        jsEngine_->eval(domCompatInit, "dom-compat-init");
+
         std::cout << "[Mystral] DOM event system initialized" << std::endl;
     }
 
